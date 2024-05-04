@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <sys/poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -13,19 +13,21 @@
 #include <netinet/ip.h>
 #include <vector>
 
+#define MAX_EVENTS 10
 
+// Print messages to stderr
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
 }
 
-
+// Print errors and abort program
 static void die(const char *msg) {
     int err = errno;
     fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
 }
 
-
+// Set a file descriptor to non-blocking mode
 static void fd_set_nb(int fd) {
     errno = 0;
     int flags = fcntl(fd, F_GETFL, 0); // Get current fd file status flag
@@ -44,14 +46,13 @@ static void fd_set_nb(int fd) {
 }
 
 
-const size_t k_max_msg = 4096;
+const size_t k_max_msg = 4096; // Maximum message size
 
 enum {
     STATE_REQ = 0, // Request
     STATE_RES = 1, // Response
     STATE_END = 2  // End, Mark the connection for deletion
 };
-
 
 struct Conn {
     int fd = -1;
@@ -67,7 +68,7 @@ struct Conn {
     uint8_t wbuf[4 + k_max_msg];
 };
 
-
+// Associate a connection with its file descriptor
 static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
     if (fd2conn.size() <= static_cast<size_t>(conn->fd)) {
         fd2conn.resize(conn->fd + 1);
@@ -75,7 +76,7 @@ static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
     fd2conn[conn->fd] = conn;
 }
 
-
+// Accept new connections on a listening socket
 static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
     // Accept
     struct sockaddr_in client_addr = {};
@@ -107,11 +108,11 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
     return 0;
 } 
 
-
+// Prototypes for state handling functions
 static void state_req(Conn *conn);
 static void state_res(Conn *conn);
 
-
+// Process a single request from the connection buffer
 static bool try_one_request(Conn *conn) {
     // Try to parse a request from the buffer
     if (conn->rbuf_size < 4) {
@@ -138,6 +139,13 @@ static bool try_one_request(Conn *conn) {
     memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
     conn->wbuf_size = 4 + len;
 
+    // Remove the request from the buffer
+    size_t remain = conn->rbuf_size - 4 - len;
+    if (remain) {
+        memmove(conn->rbuf, &conn->rbuf[4 + len], remain);
+    }
+    conn->rbuf_size = remain;
+
     // Change state
     conn->state = STATE_RES;
     state_res(conn);
@@ -147,7 +155,7 @@ static bool try_one_request(Conn *conn) {
 
 }
 
-
+// Attempt to fill the conneciton's read buffer
 static bool try_fill_buffer(Conn *conn){
     // Try to fil buffer
     assert(conn->rbuf_size < sizeof(conn->rbuf));
@@ -186,12 +194,12 @@ static bool try_fill_buffer(Conn *conn){
     return (conn->state == STATE_REQ);
 }
 
-
+// Handles state for waiting for request
 static void state_req(Conn *conn) {
     while (try_fill_buffer(conn)) {}
 } 
 
-
+// Attempt to flush the connection's write buffer
 static bool try_flush_buffer(Conn *conn) {
     ssize_t rv = 0;
 
@@ -224,19 +232,19 @@ static bool try_flush_buffer(Conn *conn) {
     return true;
 }
 
-
+// Handles state for sending responses
 static void state_res(Conn *conn) {
     while (try_flush_buffer(conn)) {}
 }
 
-
+// Main IO handling logic for connection based on state
 static void connection_io(Conn *conn) {
     if (conn->state == STATE_REQ) {
         state_req(conn);
     } else if (conn->state == STATE_RES) {
         state_res(conn);
     } else {
-        assert(0); // not expected 
+        assert(0); // Unexpected state 
     }
 }
 
@@ -247,11 +255,11 @@ int main() {
         die("socket()");
     }
 
-    // this is needed for most server applications
+    // Set SO_REUSEADDR to quickly restart the server after a crash or shutdown
     int val = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
-    // bind
+    // Binding socket to port 1234
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = ntohs(1234);
@@ -273,13 +281,14 @@ int main() {
     // Set the listen fd to nonblocking mode
     fd_set_nb(fd);
 
-    // The event loop
+    // Event loop
     std::vector<struct pollfd> poll_args;
-    while (true) {
+    
+    while(true) {
         // Prepare the arguments of the poll()
         poll_args.clear();
 
-        // For convenience, the listening fd is put in the first position
+        // The listening fd is put in the first position
         struct pollfd pfd = {fd, POLLIN, 0};
         poll_args.push_back(pfd);
 
@@ -296,32 +305,30 @@ int main() {
         }
 
         // Poll for active fds
-        // The timeout argument doesn't matter here
+        // Time arguments doesn't matter here
         int rv = poll(poll_args.data(), static_cast<nfds_t>(poll_args.size()), 1000);
-        if (rv < 0) {
+        if (rv < 0){
             die("poll");
         }
 
-        // Process active connections
+        // Process active connection
         for (size_t i = 1; i < poll_args.size(); ++i) {
             if (poll_args[i].revents) {
                 Conn *conn = fd2conn[poll_args[i].fd];
                 connection_io(conn);
-
-                if(conn->state == STATE_END) {
-                    // Client closed normally, or something happened.
-                    // Destroy this conneciton
+                if (conn->state == STATE_END) {
+                    // Client closed normally or something bad happened.
                     fd2conn[conn->fd] = NULL;
                     static_cast<void>(close(conn->fd));
                     free(conn);
                 }
             }
         }
-       
-       // Try to accept a new connection if the listening fd is active
-       if (poll_args[0].revents) {
-        static_cast<void>(accept_new_conn(fd2conn, fd));
-       } 
+
+        // Try to accept a new connectio if the listening fd is active
+        if(poll_args[0].revents) {
+            static_cast<void>(accept_new_conn(fd2conn, fd));
+        }
     }
 
     return 0;
