@@ -2,30 +2,49 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/epoll.h>
 #include <sys/poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <vector>
+#include <map>
 
-#define MAX_EVENTS 10
 
-// Print messages to stderr
+// Constants
+const size_t k_max_msg = 4096; // Maximum message size
+const size_t k_max_args = 1024; // Maximum number of arguments
+
+// Connection states
+enum {
+    STATE_REQ = 0, // Request
+    STATE_RES = 1, // Response
+    STATE_END = 2 // End, mark the connection for deletion
+};
+
+// Response codes
+enum {
+    RES_OK = 0, // Success
+    RES_ERR = 1, // Error
+    RES_NX = 2 // Not Found
+};
+
+// Utility functions for error logging and error handling
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
 }
 
-// Print errors and abort program
+
 static void die(const char *msg) {
     int err = errno;
     fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
 }
+
 
 // Set a file descriptor to non-blocking mode
 static void fd_set_nb(int fd) {
@@ -46,14 +65,7 @@ static void fd_set_nb(int fd) {
 }
 
 
-const size_t k_max_msg = 4096; // Maximum message size
-
-enum {
-    STATE_REQ = 0, // Request
-    STATE_RES = 1, // Response
-    STATE_END = 2  // End, Mark the connection for deletion
-};
-
+// Connection structure representing a single client connection
 struct Conn {
     int fd = -1;
     uint32_t state = 0; // Either STATE_REQ or STATE_RES
@@ -68,13 +80,19 @@ struct Conn {
     uint8_t wbuf[4 + k_max_msg];
 };
 
-// Associate a connection with its file descriptor
+
+// Global key-value store using a map
+static std::map<std::string, std::string> g_map;
+
+
+// Associate a connection object with a file descriptor in a vector
 static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
     if (fd2conn.size() <= static_cast<size_t>(conn->fd)) {
         fd2conn.resize(conn->fd + 1);
     }
     fd2conn[conn->fd] = conn;
 }
+
 
 // Accept new connections on a listening socket
 static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
@@ -112,6 +130,111 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
 static void state_req(Conn *conn);
 static void state_res(Conn *conn);
 
+
+// Parses a request and extracts strings based on prefixed lengths
+static int32_t parseRequest(const uint8_t *data, size_t len, std::vector<std::string> &out){
+    // First 4 bytes are the number of strings to be extracted
+    if (len < 4) {
+        return -1; // Not enough data to read the initial cound of strings
+    }
+
+    uint32_t numStrings = 0;
+    memcpy(&numStrings, &data[0], 4);
+
+    if (numStrings > k_max_args) {
+        return -1; // More strings than allowed
+    }
+
+    size_t pos = 4;
+    while (numStrings--) {
+        if (pos + 4 > len) {
+            return -1; // Not enough data to read the size of the next sting
+        }
+        uint32_t sz = 0;
+        memcpy(&sz, &data[pos], 4);
+
+        if (pos + 4 + sz > len) {
+            return -1;
+        }
+        out.push_back(std::string((char *)&data[pos + 4], sz));
+        pos += 4 + sz;
+    }
+
+    if (pos != len) {
+        return -1; // Trailing garbage
+    }
+    
+    return 0;
+}
+
+// Get the value associated with a key from the g_map
+static uint32_t do_get(const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen) {
+    if (!g_map.count(cmd[1])) {
+        return RES_NX;
+    }
+
+    std::string &val = g_map[cmd[1]];
+    assert(val.size() <= k_max_msg);
+    memcpy(res, val.data(), val.size());
+    *reslen = static_cast<uint32_t>(val.size());
+
+    return RES_OK;
+}
+
+// Insert a new key-value pair or updates an existing one
+static uint32_t do_set(const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen) {
+    static_cast<void>(res);
+    static_cast<void>(reslen);
+
+    g_map[cmd[1]] = cmd[2];
+
+    return RES_OK;
+}
+
+// Remove a key and its value from map
+static uint32_t do_del(const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen) {
+    static_cast<void>(res);
+    static_cast<void>(reslen);
+
+    g_map.erase((cmd[1]));
+
+    return RES_OK;
+}
+
+static bool cmd_is(const std::string &word, const char *cmd) {
+    return 0 == strcasecmp(word.c_str(), cmd);
+}
+
+// Handles a request by determining which command to execute (get, set, del)
+static int32_t do_request(
+    const uint8_t *req, uint32_t reqlen,
+    uint32_t *rescode, uint8_t *res, uint32_t *reslen) 
+{
+    std::vector<std::string> cmd;
+    if(0 != parseRequest(req, reqlen, cmd)) {
+        msg("bad request");
+        return -1;
+    }
+
+    if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
+        *rescode = do_get(cmd, res, reslen);
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
+        *rescode = do_set(cmd, res, reslen);
+    } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
+        *rescode = do_del(cmd, res, reslen);
+    } else {
+        // Cmd is not recognized
+        *rescode = RES_ERR;
+        const char *msg = "Unknown cmd";
+        strcpy((char*)res, msg);
+        *reslen = strlen(msg);
+
+        return 0;
+    }
+
+    return 0;
+}
+
 // Process a single request from the connection buffer
 static bool try_one_request(Conn *conn) {
     // Try to parse a request from the buffer
@@ -119,6 +242,7 @@ static bool try_one_request(Conn *conn) {
         // Not enoough data in the buffer. Will retry in the next iteration.
         return false;
     }
+
     uint32_t len = 0;
     memcpy(&len, &conn->rbuf[0], 4);
     if (len > k_max_msg){
@@ -126,18 +250,27 @@ static bool try_one_request(Conn *conn) {
         conn->state = STATE_END;
         return false;
     }
+
     if (4 + len > conn->rbuf_size) {
         // no enough data in the buffer. Will retry in the next iteration
         return false;
     }
 
-    // Got one request, do something with it
-    printf("Client says: %.*s\n", len, &conn->rbuf[4]); 
+    // Got one request, generate the response
+    uint32_t rescode = 0;
+    uint32_t wlen = 0;
+    int32_t err = do_request(&conn->rbuf[4], len, &rescode, &conn->wbuf[4+4], &wlen);
+
+    if(err) {
+        conn->state = STATE_END;
+        return false;
+    }
 
     // Generation echoing response
-    memcpy(&conn->wbuf[0], &len, 4);
-    memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
-    conn->wbuf_size = 4 + len;
+    wlen += 4;
+    memcpy(&conn->wbuf[0], &wlen, 4);
+    memcpy(&conn->wbuf[4], &rescode, 4);
+    conn->wbuf_size = 4 + wlen;
 
     // Remove the request from the buffer
     size_t remain = conn->rbuf_size - 4 - len;
