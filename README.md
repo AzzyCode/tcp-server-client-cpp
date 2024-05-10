@@ -37,19 +37,19 @@ The server will listen on port 1234 for incoming connections. Ensure the port is
 
 To interact with the server using the client, open a new terminal window and run the following commands depending on the action you want to perform:
 
-### Set Value
+- **Set Value:**
 ```bash
 ./client set your_key your_value
 ```
 Replace your_key and your_value with the key and value you wish to set.
 
-### Get a value:
+- **Get a value:**
 ```bash
 ./client get your_key
 ```
 Replace your_key with the key whose value you want to retrieve.
 
-### Delete a key:
+- **Delete a key:**
 ```bash
 ./client del your_key
 ```
@@ -59,18 +59,22 @@ These commands allow you to interact directly with the key-value store implement
 
 ## Usage Examples
 
-### Setting Value:
+- **Setting Value:**
 ```bash
 ./client set username alice
 ```
 
-### Retrieving a value:
+- **Retrieving a value:**
 ```bash
 ./client get username
 ```
 
-### Deleting a value:
+- **Deleting a value:**
 ```bash
 ./client del username
 ```
+
+## License
+
+This project is open source and available under the MIT License.
 
