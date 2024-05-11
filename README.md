@@ -1,6 +1,6 @@
 # Simple TCP/IP Server and Client
 
-This repository contains the implementation of a basic TCP/IP server and client using sockets that communicate over a network to perform operations on a simple key-value store.
+This project implements a basic TCP/IP server and client that use sockets to communicate over a network. The primary function of this system is to manipulate a simple key-value store, demonstrating fundamental network interaction capabilities.
 
 ## Features
 
